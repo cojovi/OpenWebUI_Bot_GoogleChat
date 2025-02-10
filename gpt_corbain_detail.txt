@@ -1,0 +1,319 @@
+Got it! I'll provide a full step-by-step guide on connecting your OpenWebUI AI bot to Google Chat, including authentication setup, API integration, and error handling—all in Python. I'll also include a rewritten Python implementation of your bot, making it work with Ngrok for now. I'll let you know once everything is ready.
+
+Research completed in 6m · 13 sources
+Integrating an OpenWebUI AI Bot with Google Chat (Python & Flask)
+Integrating an OpenWebUI AI bot with Google Chat involves creating a webhook service that receives messages from Chat and forwards them to your OpenWebUI instance, then returns the AI’s response back to Chat. This guide will walk through setting up a Flask app in Python for the bot logic, exposing it with Ngrok, configuring Google Chat (authentication and webhooks), implementing logging/error handling, and testing in Google Chat.
+
+1. Python Implementation (Flask Webhook Bot)
+First, we’ll implement the chat bot server in Python using Flask. The Flask app will accept HTTP POST requests from Google Chat (containing user messages), call the OpenWebUI API to get a response, and then return a JSON response that Google Chat displays.
+
+Key tasks for the Flask app:
+
+Define a webhook route (e.g. /webhook) to receive chat events.
+Verify incoming requests are from Google (using the provided bearer token).
+Parse the incoming JSON to extract the user's message.
+Call the OpenWebUI API with the user’s message to generate a response.
+Return the response text in the format Google Chat expects (JSON with a "text" field).
+Below is a complete example of the Flask bot implementation. Be sure to replace placeholders (like YOUR_GCP_PROJECT_NUMBER for your Google Cloud project number, and YOUR_OWUI_API_KEY for your OpenWebUI API key):
+
+import os, logging
+from flask import Flask, request, jsonify
+import requests
+import jwt  # PyJWT library for verifying JSON Web Tokens
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)  # Configure basic logging
+
+# Google Chat verification setup
+GCP_PROJECT_NUMBER = os.environ.get("GCP_PROJECT_NUMBER", "<YOUR_GCP_PROJECT_NUMBER>")
+# URL to Google Chat's public keys (JWKS) for verifying tokens
+GOOGLE_CHAT_JWKS_URL = "https://www.googleapis.com/service_accounts/v1/jwk/chat@system.gserviceaccount.com"
+jwks_client = jwt.PyJWKClient(GOOGLE_CHAT_JWKS_URL)
+
+# OpenWebUI API setup
+OWUI_API_URL = os.environ.get("OWUI_API_URL", "http://localhost:3000/api/v1")  # base URL of OpenWebUI API
+OWUI_API_KEY = os.environ.get("OWUI_API_KEY", "<YOUR_OWUI_API_KEY>")  # API key from OpenWebUI settings&#8203;:contentReference[oaicite:0]{index=0}
+
+# In-memory store for chat sessions (maps Google Chat space -> OpenWebUI chat ID)
+chat_sessions = {}
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+		# Verify the request is from Google Chat by checking the JWT in Authorization header
+		auth_header = request.headers.get('Authorization', '')
+		token = auth_header.split('Bearer ')[-1] if auth_header.startswith('Bearer ') else None
+		if not token:
+				app.logger.error("Missing Authorization token")
+				return jsonify({"error": "Unauthorized"}), 401
+		try:
+				signing_key = jwks_client.get_signing_key_from_jwt(token)
+				decoded_token = jwt.decode(token, signing_key.key, algorithms=["RS256"], 
+																		audience=GCP_PROJECT_NUMBER, issuer="chat@system.gserviceaccount.com")
+				# If verification passes, decoded_token contains token claims (not used further here)
+		except Exception as e:
+				app.logger.error(f"Failed to verify Google Chat JWT: {e}")
+				return jsonify({"error": "Unauthorized"}), 401
+				
+		event = request.get_json()  # Parse the JSON body of the request
+		app.logger.info(f"Received event from Chat: {event}")
+		
+		# Handle different event types
+		event_type = event.get("type")
+		if event_type == "ADDED_TO_SPACE":
+				# Bot was added to a space (group chat) or DM
+				user_name = event.get("user", {}).get("displayName", "there")
+				welcome_text = f"Hello {user_name}, I'm your OpenWebUI bot! Ask me anything."
+				return jsonify({"text": welcome_text})
+		if event_type == "REMOVED_FROM_SPACE":
+				# Bot removed – clean up session if any
+				space = event.get("space", {}).get("name")
+				if space in chat_sessions:
+						chat_sessions.pop(space, None)
+				return jsonify({})  # No response needed
+				
+		# Default case: MESSAGE event (a user sent a message in a space or DM)
+		user_message = event.get("message", {}).get("text", "")
+		if not user_message:
+				return jsonify({})  # nothing to do if no message text
+				
+		# Identify the chat (space or DM) to maintain context
+		space_id = event.get("space", {}).get("name")  # e.g., "spaces/XXXXXXXX"
+		if space_id not in chat_sessions:
+				# Create a new chat session in OpenWebUI for this conversation
+				try:
+						resp = requests.post(f"{OWUI_API_URL}/chats/new", 
+																	headers={"Authorization": f"Bearer {OWUI_API_KEY}",
+																					"Content-Type": "application/json"},
+																	json={"chat": {}})
+						resp.raise_for_status()
+				except Exception as e:
+						app.logger.error(f"Failed to create new chat in OpenWebUI: {e}")
+						return jsonify({"text": "Sorry, I couldn't start a session with the AI."})
+				chat_id = resp.json().get("id") or resp.json().get("chat_id")
+				chat_sessions[space_id] = chat_id
+				app.logger.info(f"Started new OpenWebUI chat session {chat_id} for space {space_id}")
+		else:
+				chat_id = chat_sessions[space_id]
+				
+		# Forward the user message to OpenWebUI API to get AI response
+		try:
+				payload = {"chat": {"content": user_message, "role": "user"}}
+				resp = requests.post(f"{OWUI_API_URL}/chats/{chat_id}",
+															headers={"Authorization": f"Bearer {OWUI_API_KEY}",
+																			"Content-Type": "application/json"},
+															json=payload, timeout=15)
+				resp.raise_for_status()
+		except Exception as e:
+				app.logger.error(f"Error calling OpenWebUI API: {e}")
+				return jsonify({"text": "⚠️ Error: The AI service is unavailable at the moment."})
+				
+		# Extract the assistant's reply from OpenWebUI response
+		owui_data = resp.json()
+		# The exact response structure depends on OpenWebUI; assume the assistant's reply text is present:
+		assistant_reply = ""
+		# Try typical fields where content might be:
+		if "chat" in owui_data:
+				# Some versions return the last chat message under 'chat'
+				content = owui_data["chat"].get("content")
+				role = owui_data["chat"].get("role")
+				if role == "assistant" and content:
+						assistant_reply = content
+		if not assistant_reply:
+				# If not found above, try other possible structure (e.g., 'assistant' key or OpenAI-like format)
+				assistant_reply = owui_data.get("assistant", {}).get("content") or owui_data.get("content", "")
+		if not assistant_reply:
+				assistant_reply = "*(No response from AI)*"
+				
+		app.logger.info(f"Responding to space {space_id} with reply: {assistant_reply}")
+		return jsonify({"text": assistant_reply})
+		
+if __name__ == '__main__':
+		app.run(port=5000)
+		
+
+Let’s break down what this code is doing:
+
+Receiving the request: The @app.route('/webhook', methods=['POST']) function gets triggered when Google Chat sends an event to our webhook. We immediately parse request.get_json() to get the event payload and determine the event type (e.g., MESSAGE, ADDED_TO_SPACE, etc.).
+
+Verifying Google Chat’s authenticity: We extract the JWT token from the Authorization: Bearer ... header and verify it. Google Chat signs requests with a service account token (issuer chat@system.gserviceaccount.com) and the token’s audience is set to your Google Cloud project number​
+DEV.TO
+. In the code above, we use PyJWT to fetch Google’s public keys and verify the token (checking signature, issuer, and audience). This ensures the request actually came from Google Chat and not an imposter​
+STACKOVERFLOW.COM
+. If verification fails, we return a 401 Unauthorized error and log it.
+
+Handling Chat events:
+
+For an ADDED_TO_SPACE event, the bot is being added to a room or DM. The code responds with a simple welcome message to acknowledge the addition.
+For a REMOVED_FROM_SPACE event, we clean up any stored context for that space (if we were maintaining conversation state) and don’t send a message back.
+For a MESSAGE event (the user sent a message), we proceed to process the user’s text.
+Maintaining conversation context: The bot uses a dictionary chat_sessions to map each Google Chat space (or DM) to an OpenWebUI chat session ID. On the first message from a new space, we create a new chat session via OpenWebUI’s API (POST /api/v1/chats/new) to start fresh conversation context. This API call returns a chat_id (usually a UUID or number identifying the conversation) which we store. Subsequent messages in the same space reuse the same chat_id so the AI has the conversation history context.
+
+Calling the OpenWebUI API: We forward the user’s message to OpenWebUI by calling the chat endpoint. In this example, we use the OpenWebUI REST API endpoints (assuming OpenWebUI is running locally at localhost:3000). We include the required authentication header Authorization: Bearer <API_KEY> using the API key obtained from OpenWebUI’s settings​
+OPEN-WEBUI.COM
+. The user message is sent in the JSON payload with the role "user". For example, the JSON might look like: {"chat": {"content": "Hello", "role": "user"}}. OpenWebUI will then generate a response from the AI model. (Ensure the OpenWebUI instance is running with your desired model loaded. If needed, you can specify a particular model in the API call – OpenWebUI also provides an OpenAI-compatible /api/chat/completions endpoint for which you can pass a "model" name​
+OPEN-WEBUI.COM
+, but here we use the chat session approach for continuity.)
+
+Returning the AI’s response: Once we get OpenWebUI’s reply, we extract the assistant’s response text from the JSON. The code above accounts for possible variations in the OpenWebUI response format (looking for the content of the assistant’s message). We then return a JSON response with that text. Google Chat expects the webhook response in a specific format – the simplest is just {"text": "Your reply here"}. By returning this JSON with a 200 status, Google Chat will post the text back into the chat on behalf of the bot​
+RESTACK.IO
+.
+
+Note: The Flask app runs on port 5000 by default. We’ve configured basic logging to stdout for visibility. The bot logs important events, like receiving a message, any errors from the OpenWebUI API, and the reply it sends. This will be useful for debugging.
+
+2. Exposing the Bot with Ngrok
+During development or if you cannot host the bot on a public server, Ngrok is a handy tool to expose your local Flask server to the internet. Google Chat needs a publicly accessible HTTPS endpoint to send events to your bot.
+
+Steps to use Ngrok:
+
+Install Ngrok: Download it from the official site and follow their setup instructions (you may need to sign up for an account and add your auth token for extended usage).
+
+Run Ngrok to expose your server: Once your Flask app is running locally (e.g. on port 5000), start Ngrok from a terminal:
+
+bash
+Copy
+ngrok http 5000
+This will create a public URL (likely something like https://<random>.ngrok.io) that tunnels to your local localhost:5000 server​
+RESTACK.IO
+. Keep this Ngrok process running. You will see in its output the forward URL. Copy the HTTPS URL it provides.
+
+Update Google Chat webhook URL: In the Google Chat app configuration (next section), you will use the Ngrok URL as the bot’s endpoint so that Google’s servers can reach your Flask app. Anytime you restart Ngrok you’ll get a new URL, so remember to update the webhook URL in Chat config if needed during development.
+
+Ngrok will relay requests from Google Chat to your Flask app and you’ll also be able to inspect the request details via the Ngrok web interface (useful for debugging). This setup lets you test the bot live without deploying to a cloud service yet.
+
+3. Google Chat Authentication & Setup
+Before Google Chat will send messages to your bot, you need to configure a Chat App in Google Cloud and set up authentication properly. There are two sides to authentication:
+
+Verifying incoming requests (which we already implemented via JWT verification in the Flask code), and
+Setting up the Chat app’s identity and permissions in Google Cloud.
+a. Create and Configure the Chat App in Google Cloud:
+
+Create a Google Cloud Project (if you don’t have one for this bot) and note its Project Number (you can find the project number in the Cloud Console Project info; this is the number the JWT’s audience must match).
+
+Enable the Google Chat API for your project. In the Cloud Console, navigate to APIs & Services and enable Google Chat API​
+RESTACK.IO
+.
+
+Configure the Chat App: Go to the Google Chat API configuration page for your project (in Cloud Console under “APIs & Services” > “Google Chat API” > “Configuration”). Here you will set up how your bot works:
+
+App name, Avatar, Description: Enter a name for your bot, an avatar URL (optional), and a short description. This is what users will see in Google Chat.
+Enable Interactive Features: Toggle on “Enable interactive features” – this allows your bot to receive and respond to messages in Chat​
+DEVELOPERS.GOOGLE.COM
+.
+Connection settings: Choose “HTTP Endpoint” (or “App URL”) as the connection type for your bot, since we are hosting our own webhook. Then paste the Ngrok HTTPS URL into the endpoint URL field​
+DEVELOPERS.GOOGLE.COM
+. This tells Google Chat where to send events (like messages) for your app.
+Permissions / Access: By default, you may keep the bot as “Private” or in development, meaning only users in your Google Workspace domain or specified test users can interact with it. (If you’re just testing in your own chat, add yourself or your Workspace domain as allowed.) For wider usage or publishing, you’d go through an approval process, but for now ensure your account has access.
+Save the configuration. Google Chat will now know about your bot and where to reach it.
+
+At this point, Google’s Chat service will start sending HTTP POST requests to your Flask webhook whenever the bot is invoked (added to a space, mentioned, messaged, etc.). The requests will include an Authorization: Bearer <token> header as discussed. Our Flask code verifies this token’s signature and claims to ensure the request is genuinely from Google Chat servers​
+DEV.TO
+. Under the hood, that token is a JWT issued by Chat’s service account (chat@system.gserviceaccount.com) targeted for your project’s audience (project number)​
+DEV.TO
+. We used Google’s public keys (fetched from their JWKS endpoint) to validate it, as recommended​
+STACKOVERFLOW.COM
+.
+
+b. No Additional Auth Needed to Send Responses: Our bot’s responses are sent simply by returning JSON in the webhook reply. We do not need to separately authenticate to Google to send a message in response to an incoming event. The Google Chat API will accept the response payload we return and post it in the chat. However, if you wanted your bot to send proactive messages or perform Google Workspace actions, you’d need to use a service account and OAuth2 for the Google Chat REST API. In this guide’s scope, responding via the webhook is sufficient.
+
+4. Google Chat Webhook Setup (Connecting Chat to Your Bot)
+With the Google Cloud project and Chat app configured, the webhook connection is mostly in place. To summarize the webhook setup:
+
+Endpoint URL: Make sure the Chat app’s endpoint is set to your Flask app’s public URL (from Ngrok or your deployed server). Double-check it’s https (Google Chat requires a secure URL).
+
+Event Types: Google Chat will send different event types to this endpoint. As shown in our code, typical event types include:
+
+ADDED_TO_SPACE: when the bot is added/invited to a chat (either a room or a direct message).
+REMOVED_FROM_SPACE: when the bot is removed.
+MESSAGE: when a user sends a message that the bot should respond to (in a DM or by mentioning the bot in a space).
+(There are also CARD_CLICKED events for interactive card UIs, not covered here.)
+Message Format: The JSON payload will contain details like the space, the message text, sender info, etc. For example, a MESSAGE event payload might look like:
+
+json
+Copy
+{
+	"type": "MESSAGE",
+	"message": {
+		"text": "Hello bot",
+		"sender": { "displayName": "Alice", ... },
+		...
+	},
+	"space": { "name": "spaces/AAAA123", "type": "ROOM", ... }
+}
+Our code uses these fields to get the text and identify the space. When responding, we simply return {"text": "Your reply"}. (Google Chat also supports rich card responses, but those can be added once basic functionality is working.)
+
+Test the Webhook with Curl (Optional): If you want to verify your Flask endpoint works before involving Google Chat, you can simulate a Chat event by sending an HTTP POST with a sample JSON to your Ngrok URL. (Remember to include a dummy Authorization header if your code is strictly checking JWT, or temporarily disable the JWT check for this test.) For example:
+
+bash
+Copy
+curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer dummy" \
+			-d '{"type":"MESSAGE","message": {"text": "Ping"}}' \
+			https://<your-ngrok-id>.ngrok.io/webhook
+This should return a JSON with the bot’s reply if everything is set up correctly.
+
+5. Logging and Error Handling
+Implementing robust logging and error handling is crucial for troubleshooting and maintaining your bot:
+
+Logging Requests and Responses: We used Python’s logging (and Flask’s app.logger) to log key events. For instance, on each incoming event, we log the payload (app.logger.info(f"Received event: {event}")). We also log the OpenWebUI chat session ID creation and the AI’s reply. These logs help trace the conversation flow and debug any issues with message parsing or API calls. You can adjust log levels as needed (e.g., use DEBUG for more granular logs).
+
+Error Handling for External Calls: The code wraps the OpenWebUI API calls in try/except blocks. If the OpenWebUI API request fails (due to connection issues, timeouts, etc.), we catch the exception, log an error (app.logger.error(...) with the exception details), and return a safe error message to the user. This prevents the bot from crashing on a failed API call and provides user feedback. Similarly, verification errors or missing data are handled with appropriate responses (401 for unauthorized, or empty JSON if nothing to do).
+
+HTTP Status Codes: Ensure your webhook returns correct HTTP statuses. A 200 OK with a JSON body is expected for normal processing. If your bot returns a non-2xx status or times out, Google Chat will log an error (visible in Chat or in Cloud logs). By handling exceptions and returning a friendly message (with 200 status), we keep the user experience smooth. Only return 4xx/5xx if you truly want to signal a problem to Google (e.g., unauthorized access as we did for invalid tokens).
+
+Persistent Logging: For production, consider writing logs to a file or external logging service for later analysis. The basic config we used prints to console (which Ngrok or your server will show). You might integrate with Google Cloud Logging if running on Cloud Run or App Engine, for example.
+
+Edge Cases: Add handling for any other event types you anticipate. In our simple bot, we didn’t implement card clicks or slash commands, but you should at least log unexpected event types so you know if they occur.
+
+By instrumenting your bot with logging, you’ll be able to see each step: receiving the message, sending to OpenWebUI, and the reply. If the bot isn’t responding as expected, logs will often reveal whether the message reached your app, if the AI call was made, or if any exceptions occurred.
+
+6. Testing and Debugging in Google Chat
+Once everything is configured, it’s time to test the integration end-to-end:
+
+Add the Bot to Chat: Open Google Chat (in Gmail or the Chat app/Web interface). If your bot is private (development mode), you might need to directly invite it. In a direct message, you can search for your bot by name (it should appear with a “(Test)” label if not published) and start a DM. In a Space (group chat), use the Add people and apps option to add your bot by name/email.
+
+Send a Message: Try sending a message to the bot. In a DM, any message will be delivered to the bot. In a space (group chat), mention the bot (e.g. @YourBot Hello) when asking it a question. Google Chat only delivers messages to the bot if it’s directly addressed (mentioned) or in a DM​
+STACKOVERFLOW.COM
+. If you just type in a group chat without mentioning the bot, the bot will not receive that event (and thus won’t respond)​
+STACKOVERFLOW.COM
+. This is expected behavior for Google Chat apps.
+
+Observe Responses: The bot should respond with an AI-generated answer. For example, if you ask “What’s the weather today?” the OpenWebUI (depending on its model and knowledge) will generate a response, and the bot posts it in chat. The response should appear almost instantly (the request/response cycle happens in real-time via the webhook).
+
+Check Logs: Monitor your Flask app’s console output (and/or Ngrok’s request inspector). You should see logs for the incoming message and the actions taken. If the bot didn’t respond, check whether:
+
+The request from Google Chat reached your app (if not, there may be an Ngrok or endpoint configuration issue).
+The JWT verification didn’t block the request (you’ll see “Unauthorized” errors in the log if so – ensure your GCP_PROJECT_NUMBER is correct and that your code fetched the Google signing keys properly).
+Any exceptions in calling OpenWebUI (maybe the OpenWebUI server isn’t reachable or the API key was wrong – look for error logs).
+Google Chat will also show an error in the chat conversation if it cannot reach your bot or if your bot returns an error status. For example, you might see a system message like “Unable to connect to app.” If that happens, re-check the webhook URL and that your Flask app is running and accessible.
+Iterate: Try a variety of questions to ensure the pipeline works for different inputs. The OpenWebUI’s responses depend on the model you have loaded. If you want the bot to use a specific model or persona, you can adjust the OpenWebUI API call (for instance, OpenWebUI’s API allows specifying a model or using preset prompts).
+
+Debugging Tips:
+
+If the bot responds with a fallback like "(No response from AI)", that means the OpenWebUI API call succeeded but the response format wasn’t recognized in our parsing logic. You might need to inspect the raw owui_data JSON and adjust how you extract the assistant’s message.
+If you get 401 errors from the bot, double-check the token verification step. You can test decoding the JWT using Google’s libraries or JWT.io to ensure your code is correct. Also confirm the Cloud Project Number is used (not project ID).
+Use Ngrok’s web interface (usually http://127.0.0.1:4040) to replay requests if needed. This is useful if you want to tweak your code and resend the same event without going back to Chat every time.
+Finally, once testing is successful in a development setting, you can consider deploying this Flask app to a more permanent hosting (e.g., Google Cloud Run or another server) and update the Chat app endpoint URL accordingly. The integration architecture will remain the same.
+
+By following this guide, you have a running Google Chat bot powered by an OpenWebUI AI model. The Flask webhook receives messages and uses OpenWebUI’s API (secured with an API key) to generate intelligent replies, which are then delivered back to Google Chat users. With authentication in place for incoming requests and robust logging, the setup is secure and maintainable. You can now build on this foundation – for example, add richer message formatting, handle cards or buttons, or integrate the bot with other services as needed. Happy coding!
+
+Sources:
+
+OpenWebUI API documentation – authentication and usage​
+OPEN-WEBUI.COM
+​
+OPEN-WEBUI.COM
+Google Chat app verification (JWT token structure and validation)​
+DEV.TO
+​
+STACKOVERFLOW.COM
+Example Flask bot logic and webhook setup for Google Chat​
+RESTACK.IO
+​
+RESTACK.IO
+Google Chat API configuration steps (interactive bot and endpoint URL)​
+DEVELOPERS.GOOGLE.COM
+​
+DEVELOPERS.GOOGLE.COM
+Google Chat bot message delivery behavior (mention requirement)​
+STACKOVERFLOW.COM
+​
+STACKOVERFLOW.COM
